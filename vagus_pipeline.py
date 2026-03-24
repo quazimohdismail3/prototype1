@@ -1,212 +1,378 @@
 """
-NTNU PROTOTYPE — Vagus Pipeline v1
-====================================
+NTNU PROTOTYPE — Vagus Pipeline v2
+=====================================
 Author: Quazi Mohd Ismail, MBBS MD
-Purpose: Full pipeline — HRV → ANS State → Claude Mapping → Visual Output
+Project: Project Vagus / NTNU Prototype
+Target:  Prof. Andreas Bergsland, NTNU
 
-Run this file to execute the complete Strategy B prototype:
-  Step 1: Simulate HRV window (hrv_engine)
-  Step 2: Compute ANS state space (hrv_engine)
-  Step 3: Map to music parameters via Claude (claude_mapper)
-  Step 4: Display visual dashboard in terminal
-  Step 5: Loop continuously every 30 seconds
+Full closed-loop pipeline:
+  HRV Simulation → ANS State Space → Gemini Mapping → Audio Parameters
+  With trend tracking, clinical interpretation, and visual dashboard.
+
+Run modes:
+  python vagus_pipeline.py           → full demo (5 cycles, 30s interval)
+  python vagus_pipeline.py --quick   → test mode (3 cycles, 10s interval)
+
+Scientific Basis:
+  HRV Engine:     Task Force ESC 1996, Shaffer & Ginsberg 2017
+  ANS Mapping:    Porges Polyvagal Theory 2011
+  Music Params:   Bernardi 2006, Thayer & Lane 2000, McConnell 2014
+  Gemini Mapper:  Constrained LLM mapping, temperature=0, Pydantic schema
 """
 
-import time
 import os
 import sys
+import time
+from collections import deque
 from dotenv import load_dotenv
 
-# ── Import from our own modules ─────────────────────────
-from hrv_engine import simulate_hrv, extract_hrv_features, compute_state_space, classify_ans_state
-from claude_mapper import map_to_music, validate_music_params
+from hrv_engine import (
+    simulate_hrv,
+    extract_hrv_features,
+    compute_state_space,
+    classify_ans_state,
+)
+from gemini_mapper import map_to_music, validate_music_params
 
 load_dotenv()
 
-# ── Visual constants ────────────────────────────────────
-WIDTH = 60
-BAR_WIDTH = 30
+# ── Display constants ───────────────────────────────────
+W          = 62          # total dashboard width
+BAR        = 28          # progress bar width
+DIVIDER    = "═" * W
+THIN       = "─" * W
+TREND_LEN  = 5           # cycles to track for trend
+
+
+# ═══════════════════════════════════════════════════════
+# DISPLAY UTILITIES
+# ═══════════════════════════════════════════════════════
 
 def clear():
-    """Clear terminal screen."""
-    os.system('cls' if os.name == 'nt' else 'clear')
+    os.system("cls" if os.name == "nt" else "clear")
 
-def progress_bar(value, width=BAR_WIDTH):
-    """
-    Convert 0.0-1.0 value to a visual progress bar.
-    Example: 0.75 → [██████████████████████░░░░░░░░]  75%
-    """
-    filled = int(value * width)
-    empty  = width - filled
-    bar    = "█" * filled + "░" * empty
-    pct    = int(value * 100)
-    return f"[{bar}] {pct:3d}%"
 
-def state_color_label(state):
-    """Return a simple ASCII label for ANS state."""
-    if "PARASYMPATHETIC" in state:
+def bar(value: float, width: int = BAR) -> str:
+    """
+    Convert 0.0-1.0 float to visual progress bar.
+    0.0 → all empty  |  1.0 → all filled
+    """
+    value   = max(0.0, min(1.0, value))
+    filled  = int(value * width)
+    empty   = width - filled
+    pct     = int(value * 100)
+    return f"[{'█' * filled}{'░' * empty}] {pct:3d}%"
+
+
+def trend_arrow(history: deque) -> str:
+    """
+    Compare last two autonomic scores.
+    Returns arrow showing direction of ANS trend.
+    ↑ = improving (more parasympathetic)
+    ↓ = worsening (more sympathetic)
+    → = stable
+    """
+    if len(history) < 2:
+        return "→ (establishing baseline)"
+    delta = history[-1] - history[-2]
+    if delta > 0.05:
+        return f"↑ IMPROVING  (+{delta:.3f})"
+    elif delta < -0.05:
+        return f"↓ WORSENING  ({delta:.3f})"
+    else:
+        return f"→ STABLE     ({delta:+.3f})"
+
+
+def trend_summary(history: deque) -> str:
+    """
+    Summarise ANS trend across all recorded cycles.
+    Compares first and last autonomic score.
+    """
+    if len(history) < 2:
+        return "Insufficient data for trend analysis."
+    start   = history[0]
+    current = history[-1]
+    delta   = current - start
+    cycles  = len(history)
+    if delta > 0.1:
+        return f"Autonomic recovery in progress over {cycles} cycles (+{delta:.3f})"
+    elif delta < -0.1:
+        return f"Autonomic load increasing over {cycles} cycles ({delta:.3f})"
+    else:
+        return f"Autonomic state stable over {cycles} cycles ({delta:+.3f})"
+
+
+def clinical_note(state: dict, features: dict, music: dict) -> str:
+    """
+    Generate a one-line clinical interpretation of the current cycle.
+    Grounded in Polyvagal Theory (Porges 2011) and HRV research.
+
+    Clinical thresholds:
+    - RMSSD < 20ms: critically low vagal tone (Shaffer 2017)
+    - RMSSD 20-40ms: reduced vagal tone, sympathetic dominance
+    - RMSSD > 40ms: adequate-to-high vagal tone
+    - pNN50 < 5%: minimal parasympathetic activity
+    """
+    rmssd   = features["rmssd"]
+    pnn50   = features["pnn50"]
+    score   = state["autonomic_score"]
+    tempo   = music["tempo_bpm"]
+    freq    = music["frequency_hz"]
+
+    if rmssd < 20:
+        return (
+            f"⚠  Critical: RMSSD {rmssd:.1f}ms — severely reduced vagal tone. "
+            f"Music targeting recovery: {tempo} BPM at {freq} Hz."
+        )
+    elif rmssd < 35 or score < 0.35:
+        return (
+            f"◈  Sympathetic load: RMSSD {rmssd:.1f}ms, pNN50 {pnn50:.1f}%. "
+            f"Slow music intervention: {tempo} BPM at {freq} Hz."
+        )
+    elif score >= 0.55:
+        return (
+            f"◉  Good vagal tone: RMSSD {rmssd:.1f}ms, pNN50 {pnn50:.1f}%. "
+            f"Maintenance music: {tempo} BPM at {freq} Hz."
+        )
+    else:
+        return (
+            f"◎  Balanced ANS: RMSSD {rmssd:.1f}ms, pNN50 {pnn50:.1f}%. "
+            f"Transitional music: {tempo} BPM at {freq} Hz."
+        )
+
+
+def state_icon(state_label: str) -> str:
+    if "PARASYMPATHETIC" in state_label:
         return "◉ PARASYMPATHETIC DOMINANT"
-    elif "SYMPATHETIC" in state:
+    elif "SYMPATHETIC" in state_label:
         return "◈ SYMPATHETIC DOMINANT"
     else:
         return "◎ MIXED AUTONOMIC STATE"
 
-def print_dashboard(cycle, features, state_space, ans, music):
-    """
-    Print a full visual dashboard showing the complete pipeline
-    output for one HRV cycle.
-    """
-    divider  = "═" * WIDTH
-    thin     = "─" * WIDTH
 
-    print(divider)
-    print(f"  NTNU PROTOTYPE — Project Vagus Pipeline")
-    print(f"  Strategy B: HRV → Claude → Music")
-    print(divider)
-    print(f"  Cycle: {cycle}          Time: {time.strftime('%H:%M:%S')}")
-    print(thin)
+# ═══════════════════════════════════════════════════════
+# DASHBOARD RENDERER
+# ═══════════════════════════════════════════════════════
+
+def render_dashboard(
+    cycle:       int,
+    total:       int,
+    features:    dict,
+    state_space: dict,
+    ans:         dict,
+    music:       dict,
+    score_history: deque,
+):
+    """
+    Render the full visual dashboard for one pipeline cycle.
+
+    Sections:
+    1. Header — cycle info, timestamp
+    2. Raw HRV markers — with reference ranges
+    3. ANS state space — progress bars
+    4. ANS classification — Polyvagal label
+    5. Music parameters — progress bars + values
+    6. Clinical note — one-line interpretation
+    7. Trend analysis — direction + summary
+    """
+    print(DIVIDER)
+    print(f"  NTNU PROTOTYPE  ·  Project Vagus Pipeline v2")
+    print(f"  Strategy B: HRV → Gemini → Music Parameters")
+    print(DIVIDER)
+    print(f"  Cycle {cycle}/{total}          {time.strftime('%H:%M:%S')}          gemini-2.5-flash")
+    print(THIN)
 
     # ── Section 1: Raw HRV ──────────────────────────────
-    print(f"\n  ◆ RAW HRV MARKERS")
-    print(f"  {'RMSSD':<14} {features['rmssd']:>7.1f} ms   [vagal tone]")
-    print(f"  {'SDNN':<14} {features['sdnn']:>7.1f} ms   [total variability]")
-    print(f"  {'pNN50':<14} {features['pnn50']:>7.1f} %    [para activity]")
-    print(f"  {'SD2/SD1':<14} {features['sd2_sd1']:>7.3f}      [sym load index]")
+    print(f"\n  ◆ RAW HRV MARKERS          [reference: Shaffer 2017]")
+    print(f"  {'RMSSD':<14} {features['rmssd']:>7.1f} ms      norm: 42 ± 15 ms")
+    print(f"  {'SDNN':<14} {features['sdnn']:>7.1f} ms      norm: 50 ± 16 ms")
+    print(f"  {'pNN50':<14} {features['pnn50']:>7.1f} %       norm: 19 ± 15 %")
+    print(f"  {'SD2/SD1':<14} {features['sd2_sd1']:>7.3f}         sym load index")
 
     # ── Section 2: State Space ──────────────────────────
-    print(f"\n  ◆ ANS STATE SPACE  (0 = sympathetic → 1 = parasympathetic)")
-    print(f"  Vagal Tone   {progress_bar(state_space['vagal_tone'])}")
-    print(f"  Para Index   {progress_bar(state_space['para_activity'])}")
-    print(f"  Overall HRV  {progress_bar(state_space['overall_hrv'])}")
-    print(f"  Sym Load↓    {progress_bar(state_space['sym_load'])}")
-    print(thin)
-    score = state_space['autonomic_score']
-    print(f"  AUTONOMIC    {progress_bar(score)}  ← composite")
+    print(f"\n  ◆ ANS STATE SPACE          [0 = sympathetic → 1 = parasympathetic]")
+    print(f"  Vagal Tone    {bar(state_space['vagal_tone'])}")
+    print(f"  Para Activity {bar(state_space['para_activity'])}")
+    print(f"  Overall HRV   {bar(state_space['overall_hrv'])}")
+    print(f"  Sym Load ↓    {bar(state_space['sym_load'])}")
+    print(f"  {THIN[2:]}")
+    print(f"  AUTONOMIC     {bar(state_space['autonomic_score'])}  ← composite")
 
     # ── Section 3: ANS Classification ──────────────────
-    print(f"\n  ◆ ANS CLASSIFICATION")
-    print(f"  {state_color_label(ans['state'])}")
+    print(f"\n  ◆ ANS CLASSIFICATION       [Porges Polyvagal Theory 2011]")
+    print(f"  {state_icon(ans['state'])}")
     print(f"  Polyvagal:  {ans['polyvagal']}")
     print(f"  Physiology: {ans['physiology']}")
 
     # ── Section 4: Music Parameters ────────────────────
-    print(f"\n  ◆ MUSIC PARAMETERS  (Claude Strategy B Output)")
-    print(thin)
+    print(f"\n  ◆ MUSIC PARAMETERS         [Gemini Strategy B Output]")
+    print(THIN)
 
-    # Tempo bar
-    tempo_norm = (music['tempo_bpm'] - 40) / (120 - 40)
-    print(f"  Tempo        {progress_bar(tempo_norm)}  {music['tempo_bpm']} BPM")
+    tempo_norm = (music["tempo_bpm"] - 40) / 80
+    freq_norm  = (music["frequency_hz"] - 110) / 330
+    bin_norm   = music["binaural_offset_hz"] / 14.0
 
-    # Frequency bar
-    freq_norm = (music['frequency_hz'] - 110) / (440 - 110)
-    print(f"  Frequency    {progress_bar(freq_norm)}  {music['frequency_hz']} Hz")
-
-    # Complexity bar
-    print(f"  Harmonic     {progress_bar(music['harmonic_complexity'])}  {music['harmonic_complexity']:.2f}")
-
-    # Rhythm bar
-    print(f"  Rhythm       {progress_bar(music['rhythmic_density'])}  {music['rhythmic_density']:.2f}")
-
-    # Dynamics bar
-    print(f"  Dynamics     {progress_bar(music['dynamics'])}  {music['dynamics']:.2f}")
-
-    # Binaural
-    bin_norm = music['binaural_offset_hz'] / 14.0
-    print(f"  Binaural     {progress_bar(bin_norm)}  {music['binaural_offset_hz']} Hz")
-
-    print(thin)
+    print(f"  Tempo         {bar(tempo_norm)}  {music['tempo_bpm']} BPM")
+    print(f"  Frequency     {bar(freq_norm)}  {music['frequency_hz']} Hz")
+    print(f"  Harmonics     {bar(music['harmonic_complexity'])}  {music['harmonic_complexity']:.2f}")
+    print(f"  Rhythm        {bar(music['rhythmic_density'])}  {music['rhythmic_density']:.2f}")
+    print(f"  Dynamics      {bar(music['dynamics'])}  {music['dynamics']:.2f}")
+    print(f"  Binaural      {bar(bin_norm)}  {music['binaural_offset_hz']} Hz")
+    print(THIN)
     print(f"  Rationale: {music['mapping_rationale']}")
 
-    print(f"\n{divider}")
-    print(f"  Next cycle in 30s... Press Ctrl+C to stop.")
-    print(divider)
+    # ── Section 5: Clinical Note ────────────────────────
+    print(f"\n  ◆ CLINICAL INTERPRETATION  [Porges 2011, Shaffer 2017]")
+    print(f"  {clinical_note(state_space, features, music)}")
+
+    # ── Section 6: Trend Analysis ───────────────────────
+    print(f"\n  ◆ ANS TREND")
+    print(f"  This cycle:  {trend_arrow(score_history)}")
+    print(f"  Overall:     {trend_summary(score_history)}")
+
+    # Sparkline of autonomic scores
+    if len(score_history) > 1:
+        sparkline = ""
+        for s in score_history:
+            if s >= 0.55:
+                sparkline += "▂"
+            elif s >= 0.35:
+                sparkline += "▄"
+            else:
+                sparkline += "▆"
+        print(f"  History:     {sparkline}  (low=sym, high=para)")
+
+    print(f"\n{DIVIDER}")
+    print(f"  Next cycle in {30 if total > 3 else 10}s  ·  Ctrl+C to stop")
+    print(DIVIDER)
 
 
-def run_pipeline(cycles=5, interval_seconds=30):
+# ═══════════════════════════════════════════════════════
+# PIPELINE RUNNER
+# ═══════════════════════════════════════════════════════
+
+def run_pipeline(cycles: int = 5, interval: int = 30):
     """
-    Run the full pipeline for N cycles.
+    Run the full closed-loop pipeline.
 
     Each cycle:
-    1. Simulate 120s HRV window
-    2. Extract features
-    3. Compute state space
-    4. Classify ANS state
-    5. Map to music via Claude API
-    6. Display dashboard
-    7. Wait interval_seconds
+    1. Simulate 120s HRV window (NeuroKit2)
+    2. Extract validated HRV features
+    3. Compute normalised ANS state space
+    4. Classify ANS state (3-state Polyvagal model)
+    5. Map to music parameters via Gemini API
+    6. Validate all parameters within scientific bounds
+    7. Render visual dashboard
+    8. Track autonomic trend across cycles
+    9. Wait interval seconds before next cycle
     """
-    print("═" * WIDTH)
-    print("  NTNU PROTOTYPE — Starting Pipeline")
-    print("  HRV → ANS State → Claude → Music Parameters")
-    print("═" * WIDTH)
-    print(f"\n  Cycles planned: {cycles}")
-    print(f"  Interval:       {interval_seconds}s per cycle")
-    print(f"  Strategy:       B (Constrained Claude Mapping)")
-    print(f"  Model:          claude-sonnet-4-5, temperature=0")
-    print("\n  Starting in 3 seconds...")
+    score_history = deque(maxlen=TREND_LEN)
+
+    clear()
+    print(DIVIDER)
+    print("  NTNU PROTOTYPE — Vagus Pipeline v2")
+    print("  HRV → ANS State → Gemini → Music Parameters")
+    print(DIVIDER)
+    print(f"\n  Mode:      {'Quick Test' if cycles <= 3 else 'Full Demo'}")
+    print(f"  Cycles:    {cycles}")
+    print(f"  Interval:  {interval}s per cycle")
+    print(f"  Strategy:  B — Constrained Gemini Mapping")
+    print(f"  Model:     gemini-2.5-flash | temperature=0")
+    print(f"\n  Starting in 3 seconds...")
     time.sleep(3)
 
-    for cycle in range(1, cycles + 1):
+    completed = 0
+    failed    = 0
 
+    for cycle in range(1, cycles + 1):
         clear()
         print(f"\n  Processing cycle {cycle}/{cycles}...")
-        print(f"  Step 1/3: Simulating 120s HRV window...")
+        print(f"  Step 1: Simulating 120s HRV window (NeuroKit2)...")
 
-        # Step 1 + 2: HRV simulation and feature extraction
-        signals, info = simulate_hrv(
-            duration_seconds=120,
-            sampling_rate=1000,
-            heart_rate=68
-        )
-        features = extract_hrv_features(info, sampling_rate=1000)
-
-        print(f"  Step 2/3: Computing ANS state space...")
-
-        # Step 3 + 4: State space and classification
-        state_space = compute_state_space(features)
-        ans = classify_ans_state(state_space["autonomic_score"])
-
-        print(f"  Step 3/3: Calling Claude API for music mapping...")
-
-        # Step 5: Claude mapping
         try:
-            music = map_to_music(features, state_space, ans)
-            validate_music_params(music)
+            # Step 1-2: HRV simulation + feature extraction
+            signals, info = simulate_hrv(
+                duration_seconds=120,
+                sampling_rate=1000,
+                heart_rate=68
+            )
+            features = extract_hrv_features(info, sampling_rate=1000)
+
+            print(f"  Step 2: Computing ANS state space...")
+
+            # Step 3-4: State space + classification
+            state_space = compute_state_space(features)
+            ans         = classify_ans_state(state_space["autonomic_score"])
+
+            print(f"  Step 3: Calling Gemini API for music mapping...")
+
+            # Step 5-6: Gemini mapping + validation
+            music_obj = map_to_music(features, state_space, ans)
+            validate_music_params(music_obj)
+            music = music_obj.model_dump()
+
+            # Step 7: Track trend
+            score_history.append(state_space["autonomic_score"])
+
+            # Step 8: Render dashboard
+            clear()
+            render_dashboard(
+                cycle, cycles,
+                features, state_space, ans, music,
+                score_history
+            )
+
+            completed += 1
+
+        except KeyboardInterrupt:
+            print("\n\n  Pipeline stopped by user.")
+            break
+
         except Exception as e:
-            print(f"\n  ❌ Claude API error: {e}")
-            print(f"  Skipping cycle {cycle}. Retrying next interval.")
-            time.sleep(interval_seconds)
-            continue
+            print(f"\n  ❌ Cycle {cycle} error: {e}")
+            print(f"  Retrying next interval...")
+            failed += 1
 
-        # Step 6: Display dashboard
-        clear()
-        print_dashboard(cycle, features, state_space, ans, music)
-
-        # Step 7: Wait before next cycle
+        # Wait before next cycle
         if cycle < cycles:
-            time.sleep(interval_seconds)
+            time.sleep(interval)
 
-    # Final summary
+    # ── Final Summary ───────────────────────────────────
     clear()
-    print("═" * WIDTH)
+    print(DIVIDER)
     print("  NTNU PROTOTYPE — Pipeline Complete")
-    print(f"  {cycles} cycles completed successfully.")
-    print("  Strategy B: Constrained Claude Mapping verified.")
-    print("  Ready for audio_engine.py integration (Day 3).")
-    print("═" * WIDTH)
+    print(DIVIDER)
+    print(f"\n  Cycles completed: {completed}/{cycles}")
+    print(f"  Cycles failed:    {failed}/{cycles}")
+
+    if score_history:
+        avg_score = sum(score_history) / len(score_history)
+        print(f"\n  Average autonomic score: {avg_score:.3f}")
+        print(f"  Final trend: {trend_summary(score_history)}")
+
+        if avg_score >= 0.55:
+            print(f"\n  Overall state: PARASYMPATHETIC DOMINANT")
+            print(f"  System in recovery. High vagal tone sustained.")
+        elif avg_score <= 0.35:
+            print(f"\n  Overall state: SYMPATHETIC DOMINANT")
+            print(f"  Autonomic load detected. Music intervention active.")
+        else:
+            print(f"\n  Overall state: MIXED / TRANSITIONAL")
+            print(f"  Balanced autonomic regulation observed.")
+
+    print(f"\n  Strategy B verified across {completed} cycles.")
+    print(f"  Ready for Day 3: audio_engine.py integration.")
+    print(f"\n{DIVIDER}")
 
 
-# ── Entry point ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-
-    # Quick mode: 3 cycles, 10s interval (for testing)
-    # Full mode:  5 cycles, 30s interval (for demo)
-
-    # Detect if running in quick test mode
     quick = "--quick" in sys.argv
 
     if quick:
-        print("\n  Running in QUICK TEST MODE (3 cycles, 10s interval)")
-        run_pipeline(cycles=3, interval_seconds=10)
+        run_pipeline(cycles=3, interval=10)
     else:
-        run_pipeline(cycles=5, interval_seconds=30)
+        run_pipeline(cycles=5, interval=30)
