@@ -12,6 +12,8 @@ Full closed-loop pipeline:
 Run modes:
   python vagus_pipeline.py           → full demo (5 cycles, 30s interval)
   python vagus_pipeline.py --quick   → test mode (3 cycles, 10s interval)
+  python vagus_pipeline.py --csv     → real WHOOP data (5 cycles, 30s interval)
+  python vagus_pipeline.py --csv --quick → real WHOOP data (3 cycles, 10s interval)
 
 Scientific Basis:
   HRV Engine:     Task Force ESC 1996, Shaffer & Ginsberg 2017
@@ -33,6 +35,14 @@ from hrv_engine import (
     classify_ans_state,
 )
 from gemini_mapper import map_to_music, validate_music_params
+
+# WHOOP CSV loader — optional, only needed for --csv mode
+try:
+    from whoop_csv_loader import load_all_whoop_cycles
+    WHOOP_ENABLED = True
+except ImportError:
+    WHOOP_ENABLED = False
+    def load_all_whoop_cycles(): return []  # noqa: E731
 
 # Audio engine — degrades gracefully if sounddevice not installed
 try:
@@ -260,21 +270,24 @@ def render_dashboard(
 # PIPELINE RUNNER
 # ═══════════════════════════════════════════════════════
 
-def run_pipeline(cycles: int = 5, interval: int = 30):
+def run_pipeline(cycles: int = 5, interval: int = 30, whoop_cycles: list = None):
     """
     Run the full closed-loop pipeline.
 
     Each cycle:
-    1. Simulate 120s HRV window (NeuroKit2)
-    2. Extract validated HRV features
-    3. Compute normalised ANS state space
-    4. Classify ANS state (3-state Polyvagal model)
-    5. Map to music parameters via Gemini API
-    6. Validate all parameters within scientific bounds
-    7. Render visual dashboard
-    8. Track autonomic trend across cycles
-    9. Wait interval seconds before next cycle
+    1. Acquire HRV features — either simulate (NeuroKit2) or load from WHOOP CSV
+    2. Compute normalised ANS state space
+    3. Classify ANS state (3-state Polyvagal model)
+    4. Map to music parameters via Gemini API
+    5. Validate all parameters within scientific bounds
+    6. Render visual dashboard
+    7. Track autonomic trend across cycles
+    8. Wait interval seconds before next cycle
+
+    whoop_cycles: if provided, use this list of feature dicts in sequence
+                  instead of simulating HRV. Wraps around if cycles > len.
     """
+    using_csv = whoop_cycles is not None and len(whoop_cycles) > 0
     score_history = deque(maxlen=TREND_LEN)
 
     clear()
@@ -283,6 +296,7 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
     print("  HRV → ANS State → Gemini → Music Parameters")
     print(DIVIDER)
     print(f"\n  Mode:      {'Quick Test' if cycles <= 3 else 'Full Demo'}")
+    print(f"  Source:    {'WHOOP CSV (' + str(len(whoop_cycles)) + ' days available)' if using_csv else 'NeuroKit2 simulation'}")
     print(f"  Cycles:    {cycles}")
     print(f"  Interval:  {interval}s per cycle")
     print(f"  Strategy:  B — Constrained Gemini Mapping")
@@ -301,16 +315,22 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
         stop_audio()   # stop audio from previous cycle (no-op on first)
         clear()
         print(f"\n  Processing cycle {cycle}/{cycles}...")
-        print(f"  Step 1: Simulating 120s HRV window (NeuroKit2)...")
 
         try:
-            # Step 1-2: HRV simulation + feature extraction
-            signals, info = simulate_hrv(
-                duration_seconds=120,
-                sampling_rate=1000,
-                heart_rate=68
-            )
-            features = extract_hrv_features(info, sampling_rate=1000)
+            # Step 1: Acquire HRV features
+            if using_csv:
+                whoop_idx = (cycle - 1) % len(whoop_cycles)
+                features  = whoop_cycles[whoop_idx]
+                date_tag  = features.get("date", "")[:10]
+                print(f"  Step 1: Loading WHOOP cycle {whoop_idx} ({date_tag})...")
+            else:
+                print(f"  Step 1: Simulating 120s HRV window (NeuroKit2)...")
+                signals, info = simulate_hrv(
+                    duration_seconds=120,
+                    sampling_rate=1000,
+                    heart_rate=68
+                )
+                features = extract_hrv_features(info, sampling_rate=1000)
 
             print(f"  Step 2: Computing ANS state space...")
 
@@ -387,6 +407,7 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
             print(f"  Balanced autonomic regulation observed.")
 
     print(f"\n  Strategy B verified across {completed} cycles.")
+    print(f"  Data source: {'WHOOP CSV' if using_csv else 'NeuroKit2 simulation'}")
     if AUDIO_ENABLED:
         print(f"  Audio engine: additive synthesis + binaural beats active.")
     print(f"\n{DIVIDER}")
@@ -398,9 +419,20 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    quick = "--quick" in sys.argv
+    quick    = "--quick" in sys.argv
+    use_csv  = "--csv"   in sys.argv
 
-    if quick:
-        run_pipeline(cycles=3, interval=10)
-    else:
-        run_pipeline(cycles=5, interval=30)
+    cycles   = 3  if quick else 5
+    interval = 10 if quick else 30
+
+    whoop_cycles = None
+    if use_csv:
+        if not WHOOP_ENABLED:
+            print("ERROR: whoop_csv_loader.py not found. Cannot use --csv mode.")
+            sys.exit(1)
+        whoop_cycles = load_all_whoop_cycles()
+        if not whoop_cycles:
+            print("ERROR: No valid WHOOP cycles found in whoop_data.csv.")
+            sys.exit(1)
+
+    run_pipeline(cycles=cycles, interval=interval, whoop_cycles=whoop_cycles)
