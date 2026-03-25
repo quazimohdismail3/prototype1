@@ -34,6 +34,15 @@ from hrv_engine import (
 )
 from gemini_mapper import map_to_music, validate_music_params
 
+# Audio engine — degrades gracefully if sounddevice not installed
+try:
+    from audio_engine import play_audio, stop_audio
+    AUDIO_ENABLED = True
+except ImportError:
+    AUDIO_ENABLED = False
+    def play_audio(*args, **kwargs): pass   # noqa: E731
+    def stop_audio(): pass                  # noqa: E731
+
 load_dotenv()
 
 # ── Display constants ───────────────────────────────────
@@ -278,6 +287,10 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
     print(f"  Interval:  {interval}s per cycle")
     print(f"  Strategy:  B — Constrained Gemini Mapping")
     print(f"  Model:     gemini-2.5-flash | temperature=0")
+    if AUDIO_ENABLED:
+        print(f"  Audio:     sounddevice additive synthesis + binaural beats")
+    else:
+        print(f"  Audio:     disabled  (pip install sounddevice)")
     print(f"\n  Starting in 3 seconds...")
     time.sleep(3)
 
@@ -285,6 +298,7 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
     failed    = 0
 
     for cycle in range(1, cycles + 1):
+        stop_audio()   # stop audio from previous cycle (no-op on first)
         clear()
         print(f"\n  Processing cycle {cycle}/{cycles}...")
         print(f"  Step 1: Simulating 120s HRV window (NeuroKit2)...")
@@ -322,9 +336,20 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
                 score_history
             )
 
+            # Step 9: Play audio for this cycle (non-blocking)
+            if AUDIO_ENABLED:
+                audio_duration = max(3.0, float(interval) - 3.0)
+                play_audio(music_obj, duration_seconds=audio_duration, blocking=False)
+                right_freq = music_obj.frequency_hz + music_obj.binaural_offset_hz
+                print(f"\n  ♪  {music_obj.frequency_hz} Hz (L) / {right_freq:.1f} Hz (R)"
+                      f"  ·  {music_obj.tempo_bpm} BPM"
+                      f"  ·  {music_obj.binaural_offset_hz:.1f} Hz binaural"
+                      f"  ·  {audio_duration:.0f}s")
+
             completed += 1
 
         except KeyboardInterrupt:
+            stop_audio()
             print("\n\n  Pipeline stopped by user.")
             break
 
@@ -338,6 +363,7 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
             time.sleep(interval)
 
     # ── Final Summary ───────────────────────────────────
+    stop_audio()
     clear()
     print(DIVIDER)
     print("  NTNU PROTOTYPE — Pipeline Complete")
@@ -361,7 +387,8 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
             print(f"  Balanced autonomic regulation observed.")
 
     print(f"\n  Strategy B verified across {completed} cycles.")
-    print(f"  Ready for Day 3: audio_engine.py integration.")
+    if AUDIO_ENABLED:
+        print(f"  Audio engine: additive synthesis + binaural beats active.")
     print(f"\n{DIVIDER}")
 
 
@@ -370,6 +397,7 @@ def run_pipeline(cycles: int = 5, interval: int = 30):
 # ═══════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     quick = "--quick" in sys.argv
 
     if quick:
