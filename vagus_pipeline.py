@@ -26,6 +26,7 @@ import os
 import sys
 import time
 from collections import deque
+from music_state import MusicState
 from dotenv import load_dotenv
 
 from hrv_engine import (
@@ -34,7 +35,25 @@ from hrv_engine import (
     compute_state_space,
     classify_ans_state,
 )
-from gemini_mapper import map_to_music, validate_music_params
+try:
+    from gemini_mapper import MusicParameters, map_to_music, validate_music_params
+    GEMINI_AVAILABLE = True
+except Exception:
+    # Gemini is optional at runtime; the pipeline will fall back to state-based mapping.
+    GEMINI_AVAILABLE = False
+
+    class MusicParameters:
+        """Minimal attribute container used when Gemini SDK is unavailable."""
+
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    def map_to_music(*args, **kwargs):  # noqa: ANN001
+        raise RuntimeError("Gemini mapping unavailable (google-genai import failed).")
+
+    def validate_music_params(*args, **kwargs):  # noqa: ANN001
+        return True
 
 # WHOOP CSV loader — optional, only needed for --csv mode
 try:
@@ -289,6 +308,7 @@ def run_pipeline(cycles: int = 5, interval: int = 30, whoop_cycles: list = None)
     """
     using_csv = whoop_cycles is not None and len(whoop_cycles) > 0
     score_history = deque(maxlen=TREND_LEN)
+    state = MusicState()
 
     clear()
     print(DIVIDER)
@@ -341,9 +361,55 @@ def run_pipeline(cycles: int = 5, interval: int = 30, whoop_cycles: list = None)
             print(f"  Step 3: Calling Gemini API for music mapping...")
 
             # Step 5-6: Gemini mapping + validation
-            music_obj = map_to_music(features, state_space, ans)
-            validate_music_params(music_obj)
-            music = music_obj.model_dump()
+            try:
+                music_obj = map_to_music(features, state_space, ans)
+                validate_music_params(music_obj)
+                music = music_obj.model_dump()
+                gemini_active = True
+            except Exception as e:
+                print("\nGemini unavailable — switching to state-based mapping")
+                print(f"Reason: {e}")
+                gemini_active = False
+                music = None
+                music_obj = None
+
+            # ── STATE-BASED PARAMETERS ───────────────────────────────
+            hrv = features["rmssd"]
+
+            # trend detection using autonomic_score
+            if len(score_history) > 0:
+                prev_score = score_history[-1]
+                curr_score = state_space["autonomic_score"]
+
+                if curr_score > prev_score + 0.05:
+                    trend = "increasing"
+                elif curr_score < prev_score - 0.05:
+                    trend = "decreasing"
+                else:
+                    trend = "stable"
+            else:
+                trend = "stable"
+
+            velocity = 0
+            if len(score_history) > 0:
+                velocity = state_space["autonomic_score"] - score_history[-1]
+
+            state_params = state.update(hrv, trend, velocity)
+
+            print("\n◆ STATE-BASED PARAMETERS")
+            print(state_params)
+
+            if not gemini_active:
+                music = {
+                    "tempo_bpm": int(state_params["tempo"]),
+                    "frequency_hz": 220,
+                    "harmonic_complexity": 0.3,
+                    "rhythmic_density": 0.3,
+                    "dynamics": state_params["intensity"],
+                    "binaural_offset_hz": 5.0,
+                    "mapping_rationale": "Fallback state-based mapping",
+                }
+                music_obj = MusicParameters(**music)
 
             # Step 7: Track trend
             score_history.append(state_space["autonomic_score"])
