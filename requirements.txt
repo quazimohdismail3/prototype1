@@ -1,0 +1,6 @@
+neurokit2
+numpy
+pydantic
+google-genai
+python-dotenv
+sounddevice

@@ -16,7 +16,8 @@ Output keys: rmssd, sdnn, pnn50, sd2_sd1  (sd1/sd2 omitted — not available)
 import csv
 from pathlib import Path
 
-CSV_PATH = Path(__file__).parent / "whoop_data.csv"
+CSV_PATH        = Path(__file__).parent / "whoop_data.csv"
+SAMPLE_CSV_PATH = Path(__file__).parent / "sample_whoop_data.csv"
 
 COL_HRV  = "Heart rate variability (ms)"
 COL_RHR  = "Resting heart rate (bpm)"
@@ -36,10 +37,10 @@ def _estimate_features(rmssd: float) -> dict:
     }
 
 
-def _load_rows() -> list[dict]:
+def _load_rows(csv_path: Path = CSV_PATH) -> list[dict]:
     """Parse CSV and return cleaned rows with HRV present."""
     rows = []
-    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+    with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             hrv_raw = row.get(COL_HRV, "").strip()
@@ -88,6 +89,89 @@ def load_all_whoop_cycles() -> list[dict]:
             features["rhr_bpm"] = row["rhr"]
         cycles.append(features)
     return cycles
+
+
+def load_whoop_weekly_windows(window_size: int = 7) -> list[dict]:
+    """
+    Group daily HRV data into non-overlapping windows of `window_size` days.
+
+    Returns a list of feature dicts (oldest window first), each containing:
+      - All keys from _estimate_features() derived from the window mean RMSSD
+      - "date"       : "YYYY-MM-DD to YYYY-MM-DD"  (date range of the window)
+      - "date_start" : first day in the window (YYYY-MM-DD)
+      - "date_end"   : last day in the window (YYYY-MM-DD)
+      - "day_count"  : number of days in this window (may be < window_size for last)
+      - "hrv_values" : list of daily RMSSD values in the window
+      - "mean_rmssd" : mean RMSSD across the window
+
+    The last window may be smaller than window_size if total days is not divisible.
+    Partial windows with at least 1 valid day are included.
+    """
+    rows = _load_rows()
+    if not rows:
+        return []
+
+    # CSV is newest-first; reverse to process oldest → newest
+    rows = list(reversed(rows))
+
+    windows = []
+    for i in range(0, len(rows), window_size):
+        chunk = rows[i : i + window_size]
+        rmssd_values = [r["rmssd"] for r in chunk]
+        mean_rmssd   = sum(rmssd_values) / len(rmssd_values)
+
+        dates = [r["date"][:10] for r in chunk if r["date"]]
+        date_start = dates[0]  if dates else ""
+        date_end   = dates[-1] if dates else ""
+
+        features = _estimate_features(mean_rmssd)
+        features["date"]       = f"{date_start} to {date_end}"
+        features["date_start"] = date_start
+        features["date_end"]   = date_end
+        features["day_count"]  = len(chunk)
+        features["hrv_values"] = rmssd_values
+        features["mean_rmssd"] = round(mean_rmssd, 2)
+        windows.append(features)
+
+    return windows
+
+
+def load_sample_weeks(window_size: int = 7) -> list[dict]:
+    """
+    Load the 3 bundled high-variance demo weeks from sample_whoop_data.csv.
+
+    These three weeks were selected from the full WHOOP dataset for maximum
+    HRV variability (std ≥ 14 ms), making the ISO arc most audibly dynamic:
+      Week A: 2025-09-23 → 2025-09-29  std=15.9 ms
+      Week B: 2025-10-01 → 2025-10-07  std=14.8 ms
+      Week C: 2025-10-22 → 2025-10-28  std=21.0 ms  (min=56, max=122 ms)
+
+    Returns the same format as load_whoop_weekly_windows().
+    """
+    if not SAMPLE_CSV_PATH.exists():
+        return []
+    rows = _load_rows(SAMPLE_CSV_PATH)
+    if not rows:
+        return []
+    # CSV is newest-first; reverse to chronological order
+    rows = list(reversed(rows))
+    windows = []
+    for i in range(0, len(rows), window_size):
+        chunk = rows[i : i + window_size]
+        rmssd_values = [r["rmssd"] for r in chunk]
+        mean_rmssd   = sum(rmssd_values) / len(rmssd_values)
+        dates = [r["date"][:10] for r in chunk if r["date"]]
+        date_start = dates[0]  if dates else ""
+        date_end   = dates[-1] if dates else ""
+        features = _estimate_features(mean_rmssd)
+        features["date"]       = f"{date_start} to {date_end}"
+        features["date_start"] = date_start
+        features["date_end"]   = date_end
+        features["day_count"]  = len(chunk)
+        features["hrv_values"] = rmssd_values
+        features["mean_rmssd"] = round(mean_rmssd, 2)
+        windows.append(features)
+    return windows
 
 
 def get_whoop_stats() -> None:
